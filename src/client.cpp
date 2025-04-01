@@ -48,8 +48,9 @@ public:
             send_value = send(client_socket, command.c_str(), command.length(), 0);
             memset(buffer, 0, sizeof(buffer));
             ssize_t valread = read(client_socket, buffer, sizeof(buffer) - 1);
-            if (valread < 0) {
-                std::cout << "No response" << std::endl;
+            if (valread <= 0) {
+                std::cout << "Server stopped" << std::endl;
+                return;
             }
             std::cout << buffer << std::endl;
         }

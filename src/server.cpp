@@ -7,14 +7,21 @@
 #include <vector>
 #include <thread>
 #include <cstring>
+#include <sstream>
+#include <algorithm>
+#include <sys/epoll.h>
+#include <fcntl.h>
+
+#define MAX_EVENT 100
 
 // Server components
 class Server {
     private: 
-        int server_socket;
+        int server_socket; // this is my server file descriptor or the fd of the server
         struct sockaddr_in server_address;
         bool isActive = true;
         std::unordered_map<int, std::string> client_ips;
+        int epoll_fd;   // epoll file descriptor;
     public:
         // Constructor to get the ip and the port
         Server(int port): isActive(true) {
@@ -43,77 +50,141 @@ class Server {
                 std::cout << "failed to listen at the give port!" << std::endl;
                 exit(1);
             }
+        
+            // Creating an instance of epoll
+            epoll_fd = epoll_create1(0);
+            if (epoll_fd < 0) {
+                std::cout << "failed to create epoll" << std::endl;
+                exit(1);
+            }
+        
+            // setting the server in non blocking mode.
+            set_non_blocking(server_socket);
+        
+            struct epoll_event event;
+            event.events = EPOLLIN;
+            event.data.fd = server_socket;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket, &event) < 0) {
+                std::cout << "epoll creation failed!" << std::endl;
+                exit(1);
+            }
+        
             std::cout << "SERVER: "<< port << std::endl;
         }
 
-        // This methord will accept connecrion from the client and responde them accordingly
+        // This methord will start the server and call accept_client or handle_client based on the existing connections
         void start() {
-            struct sockaddr_in client_address;
+            struct epoll_event event[MAX_EVENT];
             while (isActive) {
-                socklen_t client_address_length = sizeof(client_address);
-                int client_socket = accept(this->server_socket, (struct sockaddr*)&client_address, &client_address_length);
-                if (client_socket < 0) {
-                    std::cout << "failed to accept connections!" << std::endl;
+                int event_count = epoll_wait(epoll_fd, event, MAX_EVENT, -1);
+                if (event_count < 0) {
+                    std::cout << "epoll failed while waiting!" << std::endl;
+                    exit(1);
                 }
             
-                char ip[16];
-                inet_ntop(AF_INET, &client_address.sin_addr, ip, 16);
-                client_ips[client_socket] = std::string(ip);
-            
-                std::cout << "Client connected: " << ip << std::endl;
-            
-                while (true)
-                {
-                    char read_buffer[2048] = {};
-                    long int bytes_recieved = recv(client_socket, read_buffer, sizeof(read_buffer), 0);
-                
-                    if (bytes_recieved <= 0) {
-                        std::cout << "Client disconnected: " << ip << std::endl;
-                        disconnect_client(client_socket);
-                        break;
+                for (int i = 0; i < event_count; i++) {
+                    int event_fd = event[i].data.fd;
+                    if (event_fd == server_socket) {
+                        accept_client();
+                    } else if (event[i].events & EPOLLIN ) {
+                        handle_client(event_fd);
                     }
-                
-                    std::string modified_command;
-                    std::string command(reinterpret_cast<char*>(read_buffer), bytes_recieved);
-                    for (char ch: command) {
-                        if (!std::isspace(ch)) {
-                            modified_command += ch;
-                        }
-                    }
-                    std::string processed_commnd = process_command(modified_command);
-                    send_response(client_socket, processed_commnd);
                 }
             }
         }
 
         // This method will stop the server 
         void stop(){
-            if (server_socket != -1) {
-                close(server_socket);
-                isActive = false;
-            }
+            close(epoll_fd);
+            close(server_socket);
+            isActive = false;
             std::cout << "Stopped!!" << std::endl;
-        }
-
-        // Using this methord the client can disconnect quitely
-        void disconnect_client(int client_socket){
-            close(client_socket);
-            return;
         }
 
         // Destructor to free up the resources
         ~Server() {
-            stop();
+            this->stop();
         }
     private:
+        // This method make the server non blocking
+        void set_non_blocking(int server_fd){
+            int flags = fcntl(server_fd, F_GETFL, 0);
+            fcntl(server_fd, F_SETFL, flags |= O_NONBLOCK);
+        }
+
+        // A method which will accepts the clients if they don't exist previously
+        void accept_client() {
+            struct sockaddr_in client_address;
+            while (isActive) {
+                socklen_t client_address_length = sizeof(client_address);
+                int client_socket = accept(this->server_socket, (struct sockaddr*)&client_address, &client_address_length);
+                if (client_socket == -1) {                    
+                    if (client_socket == EAGAIN || client_socket == EWOULDBLOCK  ) {
+                        return;
+                    }
+                    std::cout << "failed to accept connections!" << std::endl;
+                    return;
+                }
+            
+                set_non_blocking(client_socket);
+                struct epoll_event event;
+                event.events = EPOLLIN | EPOLLET;
+                event.data.fd = client_socket;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &event);
+            
+                char ip[16];
+                inet_ntop(AF_INET, &client_address.sin_addr, ip, 16);
+                client_ips[client_socket] = std::string(ip);
+            
+                std::cout << "Client connected: " << ip << std::endl;
+            }
+        }
+
+        // A method which will accepts the client requests if they are previously connected
+        void handle_client(int client_fd) {
+            struct sockaddr_in client_address;
+            char read_buffer[2048] = {};
+            long int bytes_recieved = recv(client_fd, read_buffer, sizeof(read_buffer), 0);
+        
+            char ip[16];
+                inet_ntop(AF_INET, &client_address.sin_addr, ip, 16);
+                client_ips[client_fd] = std::string(ip);
+        
+            // Will disconnect the client
+            if (bytes_recieved <= 0) {
+                std::cout << "Client disconnected: " << ip << std::endl;
+                close(client_fd);
+            }
+        
+            std::string command(reinterpret_cast<char*>(read_buffer), bytes_recieved);
+            std::vector <std::string> array_of_token = parse_command(command);
+            std::string processed_commnd = process_command(command);
+            send_response(client_fd, processed_commnd);
+            array_of_token = {};
+        }
+
+        // Methord that will parse the command when if there is no a one line output
+        std::vector<std::string> parse_command(const std::string command){
+            std::vector<std::string> tokens;
+            std::stringstream t(command);
+            std::string token;
+            while (t >> token) {
+                tokens.push_back(token);
+            }
+            return tokens;
+        }
+
         // Method which will process the command.
         std::string process_command(std::string command){
-            if (command == "hola" || command == "HOLA")  {
+            if (command == "hola")  {
                 return "AMIGO!";
-            } else if (command == "sudostop") {
-                return "STOP";
+            } else if (command == "get" || command == "GET") {
+                return "GET";
+            } else if (command == "set" || command == "SET") {
+                return "SET";
+            } else {
+                return "command not found";
             }
-            return "command not found";
         }
 
         // Method which is responsible for sending the response.
